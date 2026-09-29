@@ -2,9 +2,14 @@
 Audio processing utilities for extraction from video.
 """
 import os
-import moviepy.editor as mp
 import logging
 from typing import Optional
+
+try:
+    from moviepy import VideoFileClip
+except ImportError:
+    import moviepy.editor as mp
+    VideoFileClip = mp.VideoFileClip
 
 logger = logging.getLogger(__name__)
 
@@ -26,7 +31,7 @@ class AudioProcessor:
         """
         try:
             logger.info(f"Extracting audio from: {video_path}")
-            video = mp.VideoFileClip(video_path)
+            video = VideoFileClip(video_path)
             
             if video.audio is None:
                 logger.warning("No audio track found in video")

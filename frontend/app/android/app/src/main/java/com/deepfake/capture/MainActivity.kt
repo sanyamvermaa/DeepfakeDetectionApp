@@ -65,6 +65,8 @@ class MainActivity : AppCompatActivity() {
     // File analysis UI
     private lateinit var txtSelectedFile: TextView
     private lateinit var btnAnalyseFile: Button
+    private lateinit var editVideoUrl: EditText
+    private lateinit var btnAnalyseUrl: Button
     private lateinit var progressBar: android.widget.ProgressBar
     private lateinit var txtAnalysisStatus: TextView
     private lateinit var resultCard: LinearLayout
@@ -72,6 +74,7 @@ class MainActivity : AppCompatActivity() {
     private lateinit var txtVerdictLabel: TextView
     private lateinit var txtConfidence: TextView
     private lateinit var txtResultDetails: TextView
+    private lateinit var verifySection: LinearLayout
     private lateinit var btnMarkReal: Button
     private lateinit var btnMarkFake: Button
     private lateinit var txtVerifyStatus: TextView
@@ -84,7 +87,7 @@ class MainActivity : AppCompatActivity() {
 
     private val httpClient = OkHttpClient.Builder()
         .connectTimeout(10, TimeUnit.SECONDS)
-        .readTimeout(120, TimeUnit.SECONDS) // Video analysis can take a while
+        .readTimeout(300, TimeUnit.SECONDS) // Video analysis + model inference can take several minutes
         .build()
 
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -122,6 +125,8 @@ class MainActivity : AppCompatActivity() {
         // ── File Analysis UI ───────────────────────────────────
         txtSelectedFile = findViewById(R.id.txtSelectedFile)
         btnAnalyseFile = findViewById(R.id.btnAnalyseFile)
+        editVideoUrl = findViewById(R.id.editVideoUrl)
+        btnAnalyseUrl = findViewById(R.id.btnAnalyseUrl)
         progressBar = findViewById(R.id.progressBar)
         txtAnalysisStatus = findViewById(R.id.txtAnalysisStatus)
         resultCard = findViewById(R.id.resultCard)
@@ -129,6 +134,7 @@ class MainActivity : AppCompatActivity() {
         txtVerdictLabel = findViewById(R.id.txtVerdictLabel)
         txtConfidence = findViewById(R.id.txtConfidence)
         txtResultDetails = findViewById(R.id.txtResultDetails)
+        verifySection = findViewById(R.id.verifySection)
         btnMarkReal = findViewById(R.id.btnMarkReal)
         btnMarkFake = findViewById(R.id.btnMarkFake)
         txtVerifyStatus = findViewById(R.id.txtVerifyStatus)
@@ -198,6 +204,22 @@ class MainActivity : AppCompatActivity() {
             analyseFile(uri, serverUrl)
         }
 
+        btnAnalyseUrl.setOnClickListener {
+            val videoUrl = editVideoUrl.text.toString().trim()
+            val serverUrl = serverUrlInput.text.toString().trim()
+            if (serverUrl.isBlank()) {
+                Toast.makeText(this, "Enter server URL first", Toast.LENGTH_SHORT).show()
+                serverUrlInput.requestFocus()
+                return@setOnClickListener
+            }
+            if (videoUrl.isBlank()) {
+                Toast.makeText(this, "Paste a YouTube or Instagram link first", Toast.LENGTH_SHORT).show()
+                editVideoUrl.requestFocus()
+                return@setOnClickListener
+            }
+            analyseUrl(videoUrl, serverUrl)
+        }
+
         btnMarkReal.setOnClickListener { verifyFile("real") }
         btnMarkFake.setOnClickListener { verifyFile("fake") }
     }
@@ -237,15 +259,35 @@ class MainActivity : AppCompatActivity() {
             // Lock UI
             btnAnalyseFile.isEnabled = false
             progressBar.visibility = View.VISIBLE
-            txtAnalysisStatus.text = "Uploading and analysing…"
+            txtAnalysisStatus.text = "Preparing upload…"
             txtAnalysisStatus.visibility = View.VISIBLE
             resultCard.visibility = View.GONE
             txtVerifyStatus.visibility = View.GONE
+
+            // Estimate total time: ~10s for image, ~45s for video (upload + inference)
+            val estimatedSec = if (selectedMimeType.startsWith("video")) 45L else 10L
+            var stage = "Uploading"
+            val startTime = System.currentTimeMillis()
+
+            val timerJob = launch {
+                while (isActive) {
+                    val elapsed = (System.currentTimeMillis() - startTime) / 1000
+                    val remaining = (estimatedSec - elapsed).coerceAtLeast(0L)
+                    txtAnalysisStatus.text = if (remaining > 0) {
+                        "$stage… ~${remaining}s remaining"
+                    } else {
+                        "$stage… almost done"
+                    }
+                    delay(1000)
+                }
+            }
 
             try {
                 val bytes = withContext(Dispatchers.IO) {
                     contentResolver.openInputStream(uri)?.use(InputStream::readBytes)
                 } ?: throw Exception("Could not read file")
+
+                stage = "Analysing"
 
                 val response = withContext(Dispatchers.IO) {
                     val requestBody = MultipartBody.Builder()
@@ -277,6 +319,118 @@ class MainActivity : AppCompatActivity() {
                 throw e
             } catch (e: Exception) {
                 showError("Error: ${e.message?.take(60)}")
+            } finally {
+                timerJob.cancel()
+            }
+        }
+    }
+
+    // ─── URL Analysis (paste a YouTube/Instagram link) ──────────
+
+    private fun analyseUrl(videoUrl: String, serverUrl: String) {
+        scope.launch {
+            btnAnalyseUrl.isEnabled = false
+            progressBar.visibility = View.VISIBLE
+            txtAnalysisStatus.text = "Submitting link…"
+            txtAnalysisStatus.visibility = View.VISIBLE
+            resultCard.visibility = View.GONE
+            txtVerifyStatus.visibility = View.GONE
+
+            var currentStage = "queued"
+            var stageStartTime = System.currentTimeMillis()
+            // Rough per-stage time estimates (seconds)
+            val stageEstimates = mapOf(
+                "queued"      to 3L,
+                "downloading" to 25L,
+                "extracting"  to 8L,
+                "analyzing"   to 20L,
+            )
+
+            val timerJob = launch {
+                while (isActive) {
+                    val stageElapsed = (System.currentTimeMillis() - stageStartTime) / 1000
+                    val estimate = stageEstimates[currentStage] ?: 20L
+                    val remaining = (estimate - stageElapsed).coerceAtLeast(0L)
+                    val label = when (currentStage) {
+                        "queued"      -> "Queued"
+                        "downloading" -> "Downloading video"
+                        "extracting"  -> "Extracting frames"
+                        "analyzing"   -> "Running detection"
+                        else          -> "Processing"
+                    }
+                    txtAnalysisStatus.text = if (remaining > 0) {
+                        "$label… ~${remaining}s remaining"
+                    } else {
+                        "$label… almost done"
+                    }
+                    delay(1000)
+                }
+            }
+
+            try {
+                val jobId = withContext(Dispatchers.IO) {
+                    val requestBody = JSONObject().put("url", videoUrl).toString()
+                        .toRequestBody("application/json".toMediaType())
+
+                    val request = Request.Builder()
+                        .url(serverUrl.trimEnd('/') + "/analyze_url")
+                        .post(requestBody)
+                        .build()
+
+                    httpClient.newCall(request).execute().use { response ->
+                        val body = response.body?.string()
+                        if (!response.isSuccessful || body == null) {
+                            val detail = body?.let { runCatching { JSONObject(it).optString("detail") }.getOrNull() }
+                            throw Exception(if (!detail.isNullOrBlank()) detail else "Server error: ${response.code}")
+                        }
+                        JSONObject(body).getString("job_id")
+                    }
+                }
+
+                // Poll for status/result — up to ~5 minutes.
+                val statusUrl = serverUrl.trimEnd('/') + "/analyze_url_status/$jobId"
+                var attempts = 0
+                val maxAttempts = 200 // ~5 min at 1.5s/poll
+
+                while (attempts < maxAttempts) {
+                    attempts++
+                    delay(1500)
+
+                    val (statusJson, _) = withContext(Dispatchers.IO) {
+                        val request = Request.Builder().url(statusUrl).get().build()
+                        httpClient.newCall(request).execute().use { response ->
+                            val body = response.body?.string() ?: "{}"
+                            Pair(JSONObject(body), response.code)
+                        }
+                    }
+
+                    val newStage = statusJson.optString("status", "processing")
+                    if (newStage != currentStage) {
+                        currentStage = newStage
+                        stageStartTime = System.currentTimeMillis()
+                    }
+
+                    when (newStage) {
+                        "done" -> {
+                            showResult(statusJson)
+                            return@launch
+                        }
+                        "error" -> {
+                            showError(statusJson.optString("message", "Analysis failed"))
+                            return@launch
+                        }
+                    }
+                }
+
+                showError("Timed out waiting for analysis")
+
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                showError("Error: ${e.message?.take(60)}")
+            } finally {
+                timerJob.cancel()
+                btnAnalyseUrl.isEnabled = true
             }
         }
     }
@@ -307,7 +461,11 @@ class MainActivity : AppCompatActivity() {
         progressBar.visibility = View.GONE
         txtAnalysisStatus.visibility = View.GONE
         resultCard.visibility = View.VISIBLE
-        btnAnalyseFile.isEnabled = true
+        if (selectedFileUri != null) btnAnalyseFile.isEnabled = true
+
+        // Verification only applies to a locally-picked file — /verify needs
+        // the original bytes, which a URL-sourced result doesn't have.
+        verifySection.visibility = if (selectedFileUri != null) View.VISIBLE else View.GONE
 
         // Reset verify state
         txtVerifyStatus.text = ""
@@ -319,7 +477,7 @@ class MainActivity : AppCompatActivity() {
     private fun showError(msg: String) {
         progressBar.visibility = View.GONE
         txtAnalysisStatus.text = "❌ $msg"
-        btnAnalyseFile.isEnabled = true
+        if (selectedFileUri != null) btnAnalyseFile.isEnabled = true
     }
 
     // ─── User Verification (saves to server dataset) ───────────

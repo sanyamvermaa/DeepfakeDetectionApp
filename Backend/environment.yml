@@ -286,5 +286,6 @@ dependencies:
       - uvloop==0.22.1
       - watchfiles==1.1.1
       - websockets==16.0
+      - yt-dlp==2026.8.19
 # prefix is machine-specific — remove/update when recreating on a different machine
 # prefix: /home/valmik/miniconda3/envs/deepfake

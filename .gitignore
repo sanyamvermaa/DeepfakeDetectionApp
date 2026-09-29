@@ -41,3 +41,13 @@ Thumbs.db
 Backend/temp_audio.wav
 Backend/ws_audio_*.wav
 Backend/df_audio_*.wav
+
+# ─── Android Gradle cache (machine-local, not useful in git) ──────
+frontend/app/android/.gradle/
+frontend/app/android/local.properties
+
+# ─── Python venv ──────────────────────────────────────────────────
+venv/
+
+# ─── Runtime data files ───────────────────────────────────────────
+Backend/feedback_data.jsonl

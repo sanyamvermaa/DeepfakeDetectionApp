@@ -12,6 +12,7 @@ import os
 import sys
 import time
 import json
+import uuid
 import tempfile
 import logging
 import asyncio
@@ -23,6 +24,7 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI, File, UploadFile, Form, HTTPException, WebSocket, WebSocketDisconnect
 from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
 import uvicorn
 from PIL import Image
 
@@ -30,6 +32,7 @@ from detector import DeepFakeDetector
 from config import Config
 from concurrent.futures import ThreadPoolExecutor
 from detectors.watermark_detector import check_watermark_llm
+from utils.url_downloader import probe_video, download_video, validate_host, UrlDownloadError
 
 # ─── Logging ─────────────────────────────────────────────────────────
 logging.basicConfig(
@@ -96,6 +99,10 @@ app.add_middleware(
 request_count = 0
 total_inference_time = 0.0
 inference_lock = threading.Lock()  # Prevent concurrent model inference
+
+# ─── URL analysis job store (in-process only — single worker) ────────
+_url_jobs: dict = {}
+_url_jobs_lock = threading.Lock()
 
 
 # ─── Synchronous inference helper (runs in thread pool) ──────────────
@@ -494,18 +501,13 @@ def _ensure_verified_dirs():
     os.makedirs(_FAKE_DIR, exist_ok=True)
 
 
-def _extract_video_frames_sync(video_bytes: bytes, max_frames: int = 15) -> list:
-    """Extract up to max_frames evenly spaced PIL frames from a video in memory."""
+def _extract_video_frames_from_path(path: str, max_frames: int = 15) -> list:
+    """Extract up to max_frames evenly spaced PIL frames from a video already on disk."""
     import cv2
-    import numpy as np
 
-    tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".mp4")
-    tmp.write(video_bytes)
-    tmp.flush()
-    tmp.close()
     frames = []
+    cap = cv2.VideoCapture(path)
     try:
-        cap = cv2.VideoCapture(tmp.name)
         total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
         if total > 0:
             step = max(1, total // max_frames)
@@ -517,13 +519,24 @@ def _extract_video_frames_sync(video_bytes: bytes, max_frames: int = 15) -> list
                     break
                 frames.append(Image.fromarray(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)))
                 idx += step
+    finally:
         cap.release()
+    return frames
+
+
+def _extract_video_frames_sync(video_bytes: bytes, max_frames: int = 15) -> list:
+    """Extract up to max_frames evenly spaced PIL frames from a video in memory."""
+    tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".mp4")
+    tmp.write(video_bytes)
+    tmp.flush()
+    tmp.close()
+    try:
+        return _extract_video_frames_from_path(tmp.name, max_frames)
     finally:
         try:
             os.unlink(tmp.name)
         except OSError:
             pass
-    return frames
 
 
 @app.post("/analyze_file")
@@ -650,6 +663,133 @@ async def analyze_file(file: UploadFile = File(...)):
         }
 
     return JSONResponse(content=response)
+
+
+# ─── URL-based Analysis (paste a YouTube/Instagram link) ────────────
+
+class AnalyzeUrlRequest(BaseModel):
+    url: str
+
+
+def _evict_stale_url_jobs():
+    cutoff = time.time() - Config.JOB_RESULT_TTL_SEC
+    with _url_jobs_lock:
+        stale = [jid for jid, job in _url_jobs.items() if job.get("created_at", 0) < cutoff]
+        for jid in stale:
+            del _url_jobs[jid]
+
+
+def _run_url_job_sync(job_id: str, url: str):
+    """Runs in a background thread: download -> extract frames -> detect -> verdict."""
+    def _set(**kwargs):
+        with _url_jobs_lock:
+            _url_jobs[job_id].update(kwargs)
+
+    video_path = None
+    t_start = time.time()
+    try:
+        _set(status="downloading")
+        info = probe_video(url)
+        video_path = download_video(url)
+
+        _set(status="extracting")
+        frames = _extract_video_frames_from_path(video_path, max_frames=15)
+        if not frames:
+            raise ValueError("No frames could be extracted from this video")
+
+        _set(status="analyzing")
+        with inference_lock:
+            result = detector.video_detector.detect(frames)
+        fake_prob = result.fake_probability
+        person_detected = result.metadata.get("person_detected", True)
+
+        prediction = get_verdict(fake_prob)
+        confidence = max(fake_prob, 1.0 - fake_prob)
+        inference_time = time.time() - t_start
+
+        logger.info(f"[URL #{job_id}] {prediction} fake={fake_prob:.4f} "
+                    f"conf={confidence:.4f} frames={len(frames)} "
+                    f"time={inference_time*1000:.0f}ms")
+
+        _set(
+            status="done",
+            result={
+                "prediction": prediction,
+                "confidence": round(float(confidence), 4),
+                "fake_probability": round(float(fake_prob), 4),
+                "real_probability": round(float(1.0 - fake_prob), 4),
+                "person_detected": person_detected,
+                "frames_analyzed": len(frames),
+                "file_type": "video",
+                "source_url": url,
+                "video_title": info.get("title", ""),
+                "inference_time_ms": round(inference_time * 1000, 1),
+            },
+        )
+    except UrlDownloadError as e:
+        logger.warning(f"[URL #{job_id}] {type(e).__name__}: {e}")
+        _set(status="error", error=str(e), error_code=e.status_code)
+    except Exception as e:
+        logger.error(f"[URL #{job_id}] Unexpected error: {e}", exc_info=True)
+        _set(status="error", error=str(e), error_code=500)
+    finally:
+        if video_path:
+            try:
+                os.remove(video_path)
+                os.rmdir(os.path.dirname(video_path))
+            except OSError:
+                pass
+
+
+@app.post("/analyze_url")
+async def analyze_url(body: AnalyzeUrlRequest):
+    """
+    Kick off analysis of a video from a YouTube/Instagram URL.
+    Returns a job_id immediately — poll /analyze_url_status/{job_id} for progress/result.
+    """
+    if detector is None or detector.video_detector is None:
+        raise HTTPException(status_code=503, detail="Models not loaded")
+
+    _evict_stale_url_jobs()
+
+    url = body.url.strip()
+    if not url:
+        raise HTTPException(status_code=400, detail="No URL provided")
+
+    try:
+        # Fail fast (before creating a job) on hosts we don't support at all.
+        validate_host(url)
+    except UrlDownloadError as e:
+        raise HTTPException(status_code=e.status_code, detail=str(e))
+
+    job_id = uuid.uuid4().hex
+    with _url_jobs_lock:
+        _url_jobs[job_id] = {"status": "queued", "created_at": time.time()}
+
+    asyncio.create_task(asyncio.to_thread(_run_url_job_sync, job_id, url))
+
+    return JSONResponse(content={"job_id": job_id, "status": "queued"})
+
+
+@app.get("/analyze_url_status/{job_id}")
+async def analyze_url_status(job_id: str):
+    """Poll for the status/result of a job started via /analyze_url."""
+    with _url_jobs_lock:
+        job = _url_jobs.get(job_id)
+
+    if job is None:
+        raise HTTPException(status_code=404, detail="Job not found (expired or never existed)")
+
+    if job["status"] == "error":
+        return JSONResponse(
+            status_code=job.get("error_code", 500),
+            content={"status": "error", "message": job.get("error", "Unknown error")},
+        )
+
+    if job["status"] == "done":
+        return JSONResponse(content={"status": "done", **job["result"]})
+
+    return JSONResponse(content={"status": job["status"]})
 
 
 @app.post("/verify")

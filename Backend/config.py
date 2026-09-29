@@ -54,7 +54,21 @@ class Config:
     
     # Temporary file settings
     TEMP_AUDIO_PATH = "temp_audio.wav"
-    
+
+    # ─── URL-based Analysis (YouTube / Instagram links) ───────────
+    ALLOWED_URL_HOSTS = [
+        "youtube.com", "www.youtube.com", "m.youtube.com", "youtu.be",
+        "instagram.com", "www.instagram.com",
+    ]
+    MAX_URL_VIDEO_DURATION_SEC = 600     # Reject videos longer than 10 minutes
+    MAX_URL_VIDEO_FILESIZE_MB = 200      # Hard filesize backstop
+    # No need for HD — frames get downsampled anyway. Modern YouTube mostly serves
+    # separate video/audio streams, so prefer bestvideo+bestaudio (merged via ffmpeg)
+    # and fall back to a single pre-merged format if that's all that's available.
+    URL_DOWNLOAD_FORMAT = "bestvideo[height<=480]+bestaudio/best[height<=480]/best"
+    URL_DOWNLOAD_TIMEOUT_SEC = 120       # Max time to wait for the download itself
+    JOB_RESULT_TTL_SEC = 1800            # How long a finished job stays queryable (30 min)
+
     # Logging
     VERBOSE = True
     

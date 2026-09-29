@@ -69,12 +69,17 @@ class CvitDetector(BaseDetector):
         """Load GenConViT model, face_recognition, and OpenCV detectors."""
         try:
             import yaml
-            import dlib
-            import face_recognition as fr
             
-            self.face_recognition = fr
-            self.face_model = "cnn" if dlib.DLIB_USE_CUDA else "hog"
-            logger.info(f"dlib face backend: {self.face_model}")
+            try:
+                import dlib
+                import face_recognition as fr
+                self.face_recognition = fr
+                self.face_model = "cnn" if dlib.DLIB_USE_CUDA else "hog"
+                logger.info(f"dlib face backend: {self.face_model}")
+            except ImportError:
+                logger.warning("dlib/face_recognition not installed. Falling back to OpenCV Haar cascades.")
+                self.face_recognition = None
+                self.face_model = None
             
             # OpenCV cascade classifiers (fast, no extra files needed)
             self.haar_face = cv2.CascadeClassifier(
